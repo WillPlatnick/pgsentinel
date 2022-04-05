@@ -1,0 +1,374 @@
+#!/usr/bin/env python
+
+# pgsentinel
+# Authored by Will Platnick @ LifeChurch.tv to allow for automatic PostgreSQL failovers
+# It builds on top of several technologies we use at company:
+#   - consul - Cluster configuration information is stored via JSON in our consul cluster. 
+#   - redis - We use a PubSub connection in our production Redis environment as a communication protocol
+#             between multiple pgsentinel's. We do HA for this layer via Redis Sentinel.
+
+
+# Configuration Information
+# pgsentinel requires 3 keys in consul to function properly.
+# CLUSTERNAME = Must be unique
+# For example, our keys at the time that this was written would be:
+# key/prod/postgres/company and key/prod/postgres/companydev
+
+
+# key/prod/postgres/CLUSTERNAME/master
+#   - fqdn: FQDN of the master Postgres server. Must match sys.gethostname()
+#   - ip: IP address of the master server
+#   - port: The port we should test to make sure PGBouncer connections are flowing
+# Command line example to set:
+# curl -X PUT -d 'redis-01.company.com' http://localhost:8500/v1/kv/key/prod/postgres/company/master/fqdn
+# curl -X PUT -d '192.168.50.10' http://localhost:8500/v1/kv/key/prod/postgres/company/master/ip
+# curl -X PUT -d '6000' http://localhost:8500/v1/kv/key/prod/postgres/company/master/port
+
+
+# key/prod/postgres/CLUSTERNAME/slave
+# Has the same JSON values as the master. The sentinel will check to make sure this key exists before starting.
+# Command line example to set:
+# curl -X PUT -d 'redis-02.company.com' http://localhost:8500/v1/kv/key/prod/postgres/company/slave/fqdn
+# curl -X PUT -d '192.168.50.11' http://localhost:8500/v1/kv/key/prod/postgres/company/slave/ip
+# curl -X PUT -d '6000' http://localhost:8500/v1/kv/key/prod/postgres/company/slave/port
+
+# key/prod/postgres/company/config
+#   - dbname: Name of the database to monitor
+#   - quorum: How many sentinels have to agree on an election in order to process a failover
+#   - sentinel_name: Name of the redis-sentinel instance to connect to
+#   - trigger: The full path to the trigger file to tell Postgres to become a master
+#   - retries: How many successive failures must there be for pgsentinel to say PG is down
+#   - interval_fail: How long to wait in between retries when in a failure scenario (in seconds)
+#   - interval_good: How long to wait in betwen checks when everything is fine (in seconds)
+#   - location_lag: Byte threshold limit between the highest known pg_current_xlog_location on the master and pg_last_xlog_receive_location on the slave.
+
+# Command line example to set:
+# curl -X PUT -d '{"dbname":"company","quorum":3,"sentinel_name":"redis01-dfw.company.com-1","trigger":"/trigger","retries":5,"interval_fail":3,"interval_good":2,"location_lag":500000000}' http://localhost:8500/v1/kv/key/prod/postgres/company/config
+
+import multiprocessing
+import logging
+import time
+import select
+import psycopg2
+import os
+import socket
+import sys
+import json
+from timeout import timeout
+from redis.sentinel import Sentinel
+from pyconsul.http import Consul
+
+
+# This process is in charge of processing pgsentinel communication and electing/becoming the new master
+class ElectionWorker(multiprocessing.Process):
+
+    def __init__(self, channel, dbname, quorum, sentinel_name, trigger, location_lag):
+        multiprocessing.Process.__init__(self)
+        self.sentinel = Sentinel([('127.0.0.1', 26379)])
+        self.redis = self.sentinel.master_for(sentinel_name)
+        self.pubsub = self.redis.pubsub()
+        self.pubsub.subscribe(channel)
+        self.sentinel_pub = Sentinel([('127.0.0.1', 26379)])
+        self.redis_pub = self.sentinel_pub.master_for(sentinel_name)
+        self.consul_client = Consul()
+        self.voted_sdown = []
+        self.voted_select = []
+        self.quorum = quorum
+        self.channel = channel
+        self.dbname = dbname
+        self.trigger = trigger
+        self.location_lag = location_lag
+        self.voted_for_odown = False
+        self.voted_for_select = False
+        self.in_failover = False
+        self.last_known_xlog = 0
+        self.log = "/var/log/" + self.channel + "-election.log"
+        self.logger = logging.getLogger(self.channel)
+        self.handler = logging.FileHandler(self.log)
+        self.formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+        self.handler.setFormatter(self.formatter)
+        self.logger.addHandler(self.handler)
+        self.logger.addHandler(logging.StreamHandler())
+        self.logger.setLevel(logging.INFO)
+
+
+    @timeout(5)
+    def wait(self, conn):
+        while 1:
+            state = conn.poll()
+            if state == psycopg2.extensions.POLL_OK:
+                break
+            elif state == psycopg2.extensions.POLL_WRITE:
+                select.select([], [conn.fileno()], [])
+            elif state == psycopg2.extensions.POLL_READ:
+                select.select([conn.fileno()], [], [])
+            else:
+                raise psycopg2.OperationalError("poll() returned %s" % state)
+
+    @timeout(5)
+    def check_database(self, ip, port, dbname):
+        try:
+            conn_string = "user='dev' host='{0}' port={1} dbname='{2}' connect_timeout=5".format(
+                ip, port, dbname)
+            db = psycopg2.connect(conn_string, async=1)
+            self.wait(db)
+            cursor = db.cursor()
+            cursor.execute("SELECT pg_last_xlog_receive_location()")
+            self.wait(db)
+            temp = cursor.fetchone()[0]
+            if "/" not in temp:
+                self.logger.error("Can't get the last received xlog location, not going to participate in failover")
+                sys.exit(5)
+            else:
+                slave_xlog = temp
+                cursor.execute("SELECT pg_xlog_location_diff('" + self.last_known_xlog + "','" + slave_xlog + "')")
+                self.wait(db)
+                temp = cursor.fetchone()[0]
+                if temp > self.location_lag:
+                    self.logger.error("We are not going to failover because the slave is {0} bytes behind the last known master xlog, which is > {1}".format(cursor.fetchone()[0], self.location_lag))
+                    return False               
+            self.logger.info("OK: last known xlog: {0}, slave_xlog: {1}, difference: {2}, threshold: {3}".format(self.last_known_xlog, slave_xlog, temp, self.location_lag))
+            db.close()
+            return True
+        except Exception, e:
+            self.logger.exception(e)
+            return False
+
+
+    def work(self, item):
+        self.logger.info(str(item['channel']) + ":" + str(item['data']))
+
+    # Checks for how many pgsentinels think a server is down. If quorum is met, issue an ODOWN
+    def sdown(self, item):
+        items = str(item['data']).split()
+        self.logger.info("RECEIVED SDOWN FOR {0} FROM {1}".format(items[1], items[2]))
+        if str(items[3]) > self.last_known_xlog:
+            self.last_known_xlog = str(items[3])
+            self.logger.info("Updated last known xlog location: {0}".format(self.last_known_xlog))
+        if items[2] not in self.voted_sdown:
+            self.voted_sdown.append(items[2])
+        if len(self.voted_sdown) >= self.quorum and not self.voted_for_odown:
+            self.voted_for_sdown = True
+            self.logger.info("QUORUM MET, MARKING {0} as +ODOWN".format(items[1]))
+            self.redis_pub.publish(str(item['channel']), '+ODOWN ' + items[1] + " " + socket.gethostname())
+
+    # Removes a server from the SDOWN list because a server can communicate with the master again
+    def nosdown(self, item):
+        items = str(item['data']).split()
+        self.logger.info("RECEIVED RECOVERY FOR {0} FROM {1}".format(items[1], items[2]))
+        try:
+            self.voted_sdown.remove(items[2])
+        except:
+            pass
+
+
+    # When the new master issues the +NEWMASTER, servers set their HOSTS file accordingly.
+    def newmaster(self, item):
+        self.logger.info("A NEW MASTER HAS BEEN ELECTED. HALELUJAH! Exiting. Please update the consul key containing the slave in order to start again.")
+        sys.exit(0)
+
+
+    # When pgsentinel declares a server down, it makes sure the slave server is a valid candidate for failover, and issues a +SELECT
+    def odown(self, item):
+        if not self.voted_for_select:
+            items = str(item['data']).split()
+            self.logger.info("RECEIVED ODOWN FOR {0} FROM {1}".format(items[1], items[2]))
+            print str(item['channel'])
+            print str(item['channel']).split('-')[1] 
+            slave_fqdn = self.consul_client.storage.get('key/prod/postgres/' + str(item['channel']).split('-')[1]  + "/slave/fqdn")[0]['Value']
+            slave_ip = self.consul_client.storage.get('key/prod/postgres/' + str(item['channel']).split('-')[1]  + "/slave/ip")[0]['Value']
+            slave_port = self.consul_client.storage.get('key/prod/postgres/' + str(item['channel']).split('-')[1]  + "/slave/port")[0]['Value']
+            self.logger.info("Testing to make sure the slave {0} is responding properly".format(slave_fqdn))
+            if not self.check_database(slave_ip, slave_port, self.dbname):
+                self.logger.error("We could not find a suitable slave, so something is bad and we're not going to elect a new slave.")
+                sys.exit(1)
+            self.voted_for_select = True
+            self.redis_pub.publish(str(item['channel']), '+SELECT ' + slave_fqdn + " " + socket.gethostname())
+
+
+    # When the +SELECT goes out, if the local hostname matches the server that should be taking over
+    # It creates the trigger file, tells consul that it is the new primary, removes the slave key
+    # And issues a +NEWMASTER to tell pgsentinel to change their HOST files.
+    def select(self, item):
+        items = str(item['data']).split()
+        if items[1] == socket.gethostname():
+            if items[2] not in self.voted_select:
+                self.voted_select.append(items[2])
+            if len(self.voted_select) >= self.quorum and not self.in_failover:
+                self.in_failover = True
+                self.logger.info("OH HEY, THAT'S ME! TAKING OVER")
+                os.system("touch " + self.trigger)
+                slave_fqdn = self.consul_client.storage.get('key/prod/postgres/' + str(item['channel']).split('-')[1]  + "/slave/fqdn")[0]['Value']
+                slave_ip = self.consul_client.storage.get('key/prod/postgres/' + str(item['channel']).split('-')[1]  + "/slave/ip")[0]['Value']
+                slave_port = self.consul_client.storage.get('key/prod/postgres/' + str(item['channel']).split('-')[1]  + "/slave/port")[0]['Value']
+                self.consul_client.storage.set("key/prod/postgres/" + str(item['channel']).split('-')[1]  + "/master/fqdn", str(slave_fqdn))
+                self.consul_client.storage.set("key/prod/postgres/" + str(item['channel']).split('-')[1]  + "/master/ip", str(slave_ip))
+                self.consul_client.storage.set("key/prod/postgres/" + str(item['channel']).split('-')[1]  + "/master/port", str(slave_port))
+                self.redis_pub.publish(str(item['channel']), '+NEWMASTER')
+
+    def run(self):
+        for item in self.pubsub.listen():
+            if str(item['data']).startswith("+SDOWN"):
+                self.sdown(item)
+            if str(item['data']).startswith("-SDOWN"):
+                self.nosdown(item)
+            if str(item['data']).startswith("+ODOWN"):
+                self.odown(item)
+            if str(item['data']).startswith("+SELECT"):
+                self.select(item)
+            if str(item['data']).startswith("+NEWMASTER"):
+                self.newmaster(item)                
+            else:
+                self.work(item)
+
+
+# MasterCheck is in charge of checking if the master Postgres database is up
+# And issuing the +SDOWN when it thinks a DB is down.
+class MasterChecker(multiprocessing.Process):
+
+    def __init__(self, channel, dbname, ip, fqdn, port, sentinel_name, retries, interval_fail, interval_good):
+        multiprocessing.Process.__init__(self)
+        self.ip = ip
+        self.fqdn = fqdn
+        self.channel = channel
+        self.dbname = dbname
+        self.sentinel = Sentinel([('127.0.0.1', 26379)])
+        self.redis = self.sentinel.master_for(sentinel_name)
+        self.port = port
+        self.retries = retries
+        self.interval_fail = interval_fail
+        self.interval_good = interval_good
+        self.last_known_xlog = 0
+        self.failures = 0
+        self.voted_for_sdown = False
+        self.log = "/var/log/pgsentinel-" + self.dbname + "-checker.log"
+        self.logger = logging.getLogger(self.dbname)
+        self.handler = logging.FileHandler(self.log)
+        self.formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+        self.handler.setFormatter(self.formatter)
+        self.logger.addHandler(self.handler)
+        self.logger.addHandler(logging.StreamHandler())
+        self.logger.setLevel(logging.INFO)
+
+    @timeout(5)
+    def wait(self, conn):
+        while 1:
+            state = conn.poll()
+            if state == psycopg2.extensions.POLL_OK:
+                break
+            elif state == psycopg2.extensions.POLL_WRITE:
+                select.select([], [conn.fileno()], [])
+            elif state == psycopg2.extensions.POLL_READ:
+                select.select([conn.fileno()], [], [])
+            else:
+                raise psycopg2.OperationalError("poll() returned %s" % state)
+
+    @timeout(5)
+    def check_database(self):
+        try:
+            conn_string = "user='dev' host='{0}' port={1} dbname='{2}' connect_timeout=5".format(
+                self.ip, self.port, self.dbname)
+            db = psycopg2.connect(conn_string, async=1)
+            self.wait(db)
+            cursor = db.cursor()
+            cursor.execute('SELECT pg_current_xlog_location()')
+            self.wait(db)
+            temp = cursor.fetchone()[0]
+            if "/" in temp:
+                self.last_known_xlog = temp
+            else:
+                self.logger.error("Did not receive a valid xlog location....")
+                return False
+            db.close()
+            return True
+        except Exception, e:
+            self.logger.exception(e)
+            return False
+
+
+    def run(self):
+        # Loop infinitely until the program forces an exit
+        while True:
+            # If we are able to talk to PGBouncer
+            if self.check_database():
+                self.failures = 0
+                if self.voted_for_sdown:
+                    self.logger.info("Detected {0} as being back up, sending -SDOWN to redis and clearing internal error state".format(self.ip))
+                    self.redis.publish(
+                        'pgsentinel-' + self.channel, '-SDOWN ' + self.fqdn + " " + socket.gethostname())
+                    self.voted_for_sdown = False
+                time.sleep(self.interval_good)
+            else:
+                self.failures += 1
+                self.logger.error("Was unable to connect to {0} DB {1} times".format(self.dbname, self.failures))
+                if self.failures >= self.retries and not self.voted_for_sdown:
+                    self.voted_for_sdown = True
+                    if self.last_known_xlog != 0:
+                        self.redis.publish('pgsentinel-' + self.channel, '+SDOWN ' + self.fqdn + " " + socket.gethostname() + " " + self.last_known_xlog)
+                    else:
+                        self.logger.error("We never got a valid xlog location, so we're not going to participate in an election as it's been broken from the start")
+                        sys.exit(4)
+                else:
+                    self.logger.info("Sleeping for {0} seconds in between retries".format(self.interval_fail))
+                    time.sleep(self.interval_fail)
+
+
+def get_configured_clusters(keys):
+    clusters = []
+    for key in keys:
+        cluster = key['Key'].split('/')[3]
+        if cluster not in clusters:
+            clusters.append(cluster)
+    return clusters
+
+if __name__ == "__main__":
+    log = "/var/log/pgsentinel.log"
+    logger = logging.getLogger("pgsentinel")
+    handler = logging.FileHandler(log)
+    formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.addHandler(logging.StreamHandler())
+    logger.setLevel(logging.INFO)
+    try:
+        # This keeps track of the # of pgsentinel processes so we can take action if
+        # there are less than there are supposed to be.
+        num_processes = 0
+        consul_client = Consul()
+        # Connect to consul and grab all the different PG clusters it should be monitoring 
+        clusters = get_configured_clusters(consul_client.storage.get('key/prod/postgres', recurse=True))
+        for child in clusters:
+            try:
+                config_info = json.loads(consul_client.storage.get('key/prod/postgres/' + child + "/config")[0]['Value'])
+                master_fqdn = consul_client.storage.get('key/prod/postgres/' + child + "/master/fqdn")[0]['Value']
+                master_ip = consul_client.storage.get('key/prod/postgres/' + child + "/master/ip")[0]['Value']
+                master_port = consul_client.storage.get('key/prod/postgres/' + child + "/master/port")[0]['Value']
+                slave_fqdn = consul_client.storage.get('key/prod/postgres/' + child + "/slave/fqdn")[0]['Value']
+                slave_ip = consul_client.storage.get('key/prod/postgres/' + child + "/slave/ip")[0]['Value']
+                slave_port = consul_client.storage.get('key/prod/postgres/' + child + "/slave/port")[0]['Value']
+                if master_ip == slave_ip:
+                    logger.error("Failover PostgreSQL server is the same as the Master PostgreSQL server. Fix consul values before restarting pgsentinel")
+                    sys.exit(1)
+                client = ElectionWorker(
+                    'pgsentinel-' + child, config_info['dbname'], config_info['quorum'], config_info['sentinel_name'], config_info['trigger'], config_info['location_lag'])
+                client.start()
+                client2 = MasterChecker(child, config_info['dbname'],master_ip, master_fqdn, master_port, config_info['sentinel_name'], config_info['retries'], config_info['interval_fail'], config_info['interval_good'])
+                client2.start()
+                # Two processes for each fire cluster we monitor.
+                num_processes += 2
+            except Exception, e:
+                logger.exception(e)
+                sys.exit(1)
+        # Check to make sure all processes are running. If they're not, something has gone wrong, so bail out of everything.
+        while True:
+            if len(multiprocessing.active_children()) != num_processes:
+                print "A thread exited prematurely, going to exit all processes and terminate"
+                for process in multiprocessing.active_children():
+                    process.terminate()
+                sys.exit(3)
+            time.sleep(1)
+    # For debugging interactively
+    except KeyboardInterrupt:
+        print "Killing all processes...\n"
+        for process in multiprocessing.active_children():
+            process.terminate()
