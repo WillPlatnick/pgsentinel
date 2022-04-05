@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 # pgsentinel
-# Authored by Will Platnick @ LifeChurch.tv to allow for automatic PostgreSQL failovers
 # It builds on top of several technologies we use at company:
 #   - consul - Cluster configuration information is stored via JSON in our consul cluster. 
 #   - redis - We use a PubSub connection in our production Redis environment as a communication protocol
